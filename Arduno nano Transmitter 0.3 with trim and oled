@@ -1,0 +1,245 @@
+
+// Transmitter 0.3 with trim and oled
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>  // OLED display library
+
+#define OLED_I2C_ADDRESS 0x3C
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// Define the NRF24L01 Transmitter pins
+const uint64_t pipeOut = 0xE9E8F0F0E1LL;   // IMPORTANT: The same as in the receiver 0xE9E8F0F0E1LL
+
+RF24 radio(9, 10); // select CE,CSN pin (D9-CE,D10-CSN,D11-MOSI,D12-MISO,D13-SCK)
+
+// Define the structure to store signal data
+struct Signal {
+  byte throttle;
+  byte pitch;
+  byte roll;
+  byte yaw;
+};
+
+Signal data;
+bool connectionStatus = false; // Track the connection status
+
+// Trim variables for pitch, roll, yaw, and throttle
+int trimPitch = 0;  // Initial pitch trim value (can be adjusted)
+int trimRoll = 0;   // Initial roll trim value (can be adjusted)
+int trimYaw = 0;    // Initial yaw trim value (can be adjusted)
+int trimThrottle = 0; // Initial throttle trim value (can be adjusted)
+
+// Define button pins for trim adjustments
+const int trimThrottleDownButton = 2;     // Decrease throttle trim
+const int trimYawUpButton = 3;            // Increase yaw trim
+const int trimPitchUpButton = 4;          // Increase pitch trim
+const int trimRollDownButton = 5;         // Decrease roll trim
+
+// Reset signal data to default values
+void ResetData() {
+  data.throttle = 12;   // Motor stop
+  data.pitch = 127;     // Center
+  data.roll = 127;      // Center
+  data.yaw = 127;       // Center
+}
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Debounce variables
+unsigned long lastDebounceTime = 0;  // the last time the button state was toggled
+unsigned long debounceDelay = 200;   // the debounce time; increase if the output flickers
+
+// Previous button states
+bool lastThrottleDownButtonState = HIGH;
+bool lastYawUpButtonState = HIGH;
+bool lastPitchUpButtonState = HIGH;
+bool lastRollDownButtonState = HIGH;
+
+void setup() {
+  // Initialize the OLED display
+  if (!display.begin(OLED_I2C_ADDRESS, OLED_RESET)) {
+    Serial.println("OLED initialization failed!");
+    while (1);  // Stop if OLED fails
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("TransmReady"));
+  display.display();
+
+  // Start the NRF24L01 module
+  radio.begin();
+  radio.openWritingPipe(pipeOut);
+  radio.setAutoAck(true); // Enable auto acknowledgment
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_HIGH);
+  
+  radio.stopListening();  // Set to Transmitter mode
+  ResetData();
+
+  // Initialize trim buttons as input
+  pinMode(trimThrottleDownButton, INPUT_PULLUP);
+  pinMode(trimYawUpButton, INPUT_PULLUP);
+  pinMode(trimPitchUpButton, INPUT_PULLUP);
+  pinMode(trimRollDownButton, INPUT_PULLUP);
+
+  //Serial.begin(9600);  // Start serial communication for debugging
+  Serial.println("Transmitter Setup Done!");
+}
+
+// Joystick mapping function for the control sticks
+int mapJoystickValues(int val, int lower, int middle, int upper, bool reverse) {
+  val = constrain(val, lower, upper);
+  if (val < middle)
+    val = map(val, lower, middle, 0, 128);
+  else
+    val = map(val, middle, upper, 128, 255);
+  return (reverse ? 255 - val : val);
+}
+
+//int batteryPin = A5;  // Define the analog pin where you measure the battery voltage
+//int batteryLevel = 0;
+//int batteryPercentage = 0;
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Read the button states
+  bool currentThrottleDownButtonState = digitalRead(trimThrottleDownButton);
+  bool currentYawUpButtonState = digitalRead(trimYawUpButton);
+  bool currentPitchUpButtonState = digitalRead(trimPitchUpButton);
+  bool currentRollDownButtonState = digitalRead(trimRollDownButton);
+
+  // Throttle down button (decrease throttle trim)
+  if (currentThrottleDownButtonState == LOW && lastThrottleDownButtonState == HIGH && (currentMillis - lastDebounceTime) > debounceDelay) {
+    trimThrottle--;  // Decrease throttle trim
+    lastDebounceTime = currentMillis;  // Update debounce time
+  }
+
+  // Yaw up button (increase yaw trim)
+  if (currentYawUpButtonState == LOW && lastYawUpButtonState == HIGH && (currentMillis - lastDebounceTime) > debounceDelay) {
+    trimYaw++;  // Increase yaw trim
+    lastDebounceTime = currentMillis;
+  }
+
+  // Pitch up button (increase pitch trim)
+  if (currentPitchUpButtonState == LOW && lastPitchUpButtonState == HIGH && (currentMillis - lastDebounceTime) > debounceDelay) {
+    trimPitch++;  // Increase pitch trim
+    lastDebounceTime = currentMillis;
+  }
+
+  // Roll down button (decrease roll trim)
+  if (currentRollDownButtonState == LOW && lastRollDownButtonState == HIGH && (currentMillis - lastDebounceTime) > debounceDelay) {
+    trimRoll--;  // Decrease roll trim
+    lastDebounceTime = currentMillis;
+  }
+
+  // Update last button states
+  lastThrottleDownButtonState = currentThrottleDownButtonState;
+  lastYawUpButtonState = currentYawUpButtonState;
+  lastPitchUpButtonState = currentPitchUpButtonState;
+  lastRollDownButtonState = currentRollDownButtonState;
+
+  // Control Stick Calibration with trim adjustments
+  data.throttle = mapJoystickValues(analogRead(A0), 12, 524, 1020, true) + trimThrottle;
+  data.roll = mapJoystickValues(analogRead(A3), 12, 524, 1020, true) + trimRoll; // Apply roll trim
+  data.pitch = mapJoystickValues(analogRead(A2), 12, 524, 1020, false) + trimPitch;  // Apply pitch trim
+  data.yaw = mapJoystickValues(analogRead(A1), 12, 524, 1020, false) + trimYaw;  // Apply yaw trim
+
+  // Send data via NRF24L01 and wait for acknowledgment
+  connectionStatus = radio.write(&data, sizeof(Signal));
+
+  // Read the battery voltage
+  batteryLevel = analogRead(batteryPin);  
+  batteryPercentage = map(batteryLevel, 0, 1023, 0, 100);  // Map the analog value to percentage
+
+  // Serial Monitor Debugging Output
+  //Serial.print("Throttle Raw: ");
+  //Serial.println(analogRead(A0));
+ // Serial.print("Mapped Throttle: ");
+  //Serial.println(data.throttle);
+  //Serial.print("Trim Throttle: ");
+  //Serial.println(trimThrottle);
+  //Serial.print("Trim Pitch: ");
+  //Serial.println(trimPitch);
+  //Serial.print("Trim Roll: ");
+  //Serial.println(trimRoll);
+  //Serial.print("Trim Yaw: ");
+  //Serial.println(trimYaw);
+
+    // Serial.print(data.throttle);
+  //Serial.print(" ");
+  //Serial.print(data.yaw);
+  //Serial.print(" ");
+  //Serial.print(data.roll);
+  //Serial.print(" ");
+  //Serial.print(data.pitch);
+  //Serial.print(" ");
+  
+  //Serial.print(data.aux1);
+  //Serial.print(" ");
+  //Serial.print(data.aux2);
+  //Serial.println(" ");
+
+  // Display transmitted data on OLED
+  display.clearDisplay();
+  display.setCursor(0, 10);    // Position for Throttle
+  display.print("T:");
+  display.println(data.throttle);
+
+  display.setCursor(40, 10);   // Position for Pitch
+  display.print("P:");
+  display.println(data.pitch);
+
+  display.setCursor(40, 20);   // Position for Roll
+  display.print("R:");
+  display.println(data.roll);
+
+  display.setCursor(0, 20);  // Position for Yaw
+  display.print("Y:");
+  display.println(data.yaw);
+
+  // Display Battery Percentage
+  display.setCursor(90, 10);  // Position for Battery
+  display.print("B:");
+  display.print(batteryPercentage);
+  display.print("%");
+
+  // Display Connection Status
+  display.setCursor(0, 50);  // Position for Rec status
+  if (connectionStatus) {
+    display.println("Rec:Connected");
+  } else {
+    display.println("Rec:Disconnected");
+  }
+
+   //Display Trim Values
+  display.setCursor(0, 30);  // Position for Trim info
+  display.print("Trim P:");
+  display.print(trimPitch);
+  display.setCursor(60, 30);
+  display.print("Trim R:");
+  display.print(trimRoll);
+  display.setCursor(0, 40);
+  display.print("Trim T:");
+  display.print(trimThrottle);
+  display.setCursor(60, 40);
+  display.print("Trim Y:");
+  display.print(trimYaw);
+
+
+
+
+
+
+  display.display();  // Update the OLED display
+
+  delay(50);  // Wait before sending the next batch of data
+}
